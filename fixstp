@@ -1,0 +1,146 @@
+#!/usr/bin/env python
+#
+# This script uses the UniFi controller API to enumerate
+# the switches, and for each port on each switch with
+# the string '(EDGE)' in the description, it logs into
+# that switch and configures that port as a spanning-tree
+# edge port.  This is a workaround until Ubiquiti exposes
+# the spanning-tree edge configuration in the API
+#
+# See, e.g.,
+# https://community.ubnt.com/t5/UniFi-Routing-Switching-Feature/Spanning-tree-port-cost-edgeport-auto-edge-UI-control/idi-p/1832715
+import paramiko
+import json
+import requests
+import logging
+import pprint
+import ConfigParser
+import os
+
+# Disable insecure warnings from urllib3.
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class APIError( Exception ):
+    pass
+
+# API connection to the controller.
+# This should probably be factored out.
+class UniFiController( object ):
+    def __init__( self ):
+	cp = ConfigParser.SafeConfigParser( {
+		'host': '127.0.0.1',
+		'port': '8443',
+		'site': 'default',
+		'verify_cert': 'False',
+		} )
+	cp.read(os.path.expanduser('~/.unifi.ini'))
+	self.controller_address = cp.get( 'DEFAULT', 'host' )
+	self.controller_port = cp.getint( 'DEFAULT', 'port' )
+	self.site = cp.get( 'DEFAULT', 'site' )
+	self.username = cp.get( 'DEFAULT', 'username' )
+	self.password = cp.get( 'DEFAULT', 'password' )
+
+	self._cookies = requests.cookies.RequestsCookieJar()
+	self._session = requests.Session()
+	self._session.verify = cp.getboolean( 'DEFAULT', 'verify_cert' )
+
+    def login( self ):
+	# side effect: update cookies
+	r = self._session.post( self.url( 'login', siteSpecific=False ),
+		data=json.dumps( { 'username': self.username,
+				   'password': self.password } ) )
+	return self._parse_result( r )
+
+    def url( self, endpoint, siteSpecific=True ):
+	url = 'https://%s:%s/api/' % ( self.controller_address,
+	    self.controller_port )
+	if siteSpecific:
+	    url += 's/%s/' % ( self.site )
+	url += endpoint
+	return url
+
+    def request( self, endpoint ):
+	r = self._session.get( self.url( endpoint ),
+			       cookies=self._cookies )
+	return self._parse_result( r )
+
+    def _parse_result( self, r ):
+	result = r.json()
+	meta = result.get( "meta" )
+	if not meta:
+	    raise APIError( 'No meta returned in API call' )
+	if meta.get( 'rc', 'error' ) == 'error':
+	     msg = meta.get( 'msg', 'unknown error' )
+	     logging.error( msg )
+	     raise APIError( msg )
+	return result[ 'data' ]
+
+expectedFingerprint = {}
+
+class VerifyDeviceFingerprint( paramiko.client.MissingHostKeyPolicy ):
+    def missing_host_key( self, client, hostname, key ):
+	# Note: this key does not *always* match x_ssh_hostkey_fingerprint
+	# so just log for now.  (This also matches the controller behavior:
+	# I regularly get alerts about this mismatch, but it never resolves)
+	fingerprint = ":".join( "{:02x}".format(ord(c)) for c in key.get_fingerprint() )
+	logging.info( 'host: %s fingerprint: %s' % ( hostname, fingerprint ) )
+	expected = expectedFingerprint[ hostname ]
+	if fingerprint != expected:
+	    logging.warn( 'ssh host key fingerprint mismatch for %s' % ( hostname, ) )
+	# Accept key by returning nothing.
+	return
+
+def main():
+    logging.basicConfig( level=logging.DEBUG )
+    uc = UniFiController()
+    uc.login()
+    settings = uc.request( 'get/setting' )
+    mgmt = [ x for x in settings if x['key'] == 'mgmt' ][ 0 ]
+    sshuser = mgmt[ 'x_ssh_username' ]
+    sshpass = mgmt[ 'x_ssh_password' ]
+    devices = uc.request( 'stat/device' )
+    sshclient = paramiko.client.SSHClient()
+    sshclient.set_missing_host_key_policy( VerifyDeviceFingerprint() )
+    for device in devices:
+	name = device[ 'name' ]
+	typ = device[ 'type' ]
+	if typ != 'usw':
+	    logging.info( 'skipping %s (type=%s)' % ( name, typ ) )
+	    continue
+	logging.info( 'processing %s' % ( name, ) )
+	expectedFingerprint[ device[ 'ip' ] ] = device[ 'x_ssh_hostkey_fingerprint' ]
+	edgePorts = {}
+	for port in device[ 'port_table' ]:
+	    idx = port[ 'port_idx' ]
+	    descr = port[ 'name' ]
+	    logging.info( ' processing port %s: %s' % ( idx, descr ) )
+	    if '(EDGE)' in descr:
+		edgePorts[ idx ] = True
+	if not edgePorts:
+	    logging.info( 'no ports on this device' )
+	    continue
+	sshclient.connect( device[ 'ip' ], username=sshuser, password=sshpass )
+	session = sshclient.invoke_shell( term='dumb' )
+	# HACK
+	import time
+	time.sleep( 3 )
+	for cmd in [ 'telnet localhost', 'enable', 'configure' ]:
+	    session.send( '%s\n' % cmd )
+	    # HACK
+	    time.sleep( 1 )
+	    logging.debug( session.recv( 1000 ) )
+	for p in sorted( edgePorts ):
+	    intId = '0/%d' % p
+	    for cmd in [ 'interface %s' % intId, 'spanning-tree edgeport', 'exit', 'show running-config interface %s' % intId ]:
+		session.send( '%s\n' % cmd )
+		time.sleep( 1 )
+		logging.debug( session.recv( 10000 ) )
+	for i in range( 3 ):
+	    session.send( 'exit\n' )
+	    time.sleep( 1 )
+	    logging.debug( session.recv( 1000 ) )
+	sshclient.close()
+
+if __name__ == '__main__':
+    main()
